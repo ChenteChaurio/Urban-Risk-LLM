@@ -3,16 +3,16 @@ import PredictForm from "./components/PredictForm";
 import ResultPanel from "./components/ResultPanel";
 import MetricsPanel from "./components/MetricsPanel";
 import LogsPanel from "./components/LogsPanel";
-import RiskMap from "./components/RiskMap";
+import MapaPicker from "./components/MapaPicker";
 
 const TABS = ["Predicción", "Métricas", "Trazabilidad"];
 
 export default function App() {
   const [activeTab, setActiveTab] = useState("Predicción");
-  const [result, setResult]       = useState(null);
-  const [explanation, setExpl]    = useState(null);
-  const [loading, setLoading]     = useState(false);
-  const [tenant, setTenant]       = useState("bogota");
+  const [result, setResult] = useState(null);
+  const [explanation, setExpl] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [tenant, setTenant] = useState("bogota");
 
   const API = import.meta.env.VITE_API_URL || "http://localhost:8080/api";
 
@@ -93,7 +93,7 @@ export default function App() {
               <PredictForm onSubmit={handlePredict} loading={loading} />
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-              <RiskMap result={result} />
+              <MapaPicker />
               <ResultPanel result={result} explanation={explanation} loading={loading} />
             </div>
           </div>
