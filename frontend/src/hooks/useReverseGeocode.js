@@ -35,12 +35,14 @@ export function useReverseGeocode() {
         throw new Error(data.error);
       }
 
-      setResult({
+      const obj = {
         displayName: data.display_name,
         address: data.address,
         lat: parseFloat(data.lat),
         lng: parseFloat(data.lon),
-      });
+      };
+      setResult(obj);
+      return obj;
     } catch (err) {
       setError(err.message ?? "Error desconocido");
     } finally {

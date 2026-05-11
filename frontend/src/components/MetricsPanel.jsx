@@ -4,7 +4,7 @@ const MODEL_NAMES = { rf: "Random Forest", xgb: "XGBoost", dnn: "Red Neuronal" }
 const MODEL_DESC  = {
   rf:  "200 árboles · max_depth=12 · SMOTE balanceado",
   xgb: "200 estimadores · lr=0.1 · max_depth=6 · SMOTE",
-  dnn: "MLP (128→64) · ReLU · 200 épocas · datos escalados",
+  dnn: "MLP (96→48) · ReLU · early stopping · datos escalados",
 };
 
 function MetricCard({ name, data }) {
@@ -64,13 +64,33 @@ export default function MetricsPanel({ api }) {
     <div>
       <h2 style={{ color: "#f1f5f9", marginBottom: 8 }}>📊 Métricas de Modelos Entrenados</h2>
       <p style={{ color: "#64748b", fontSize: 13, marginBottom: 24 }}>
-        Dataset: 11.650 registros · Split 80/20 estratificado · Balanceo SMOTE
+        Dataset: {data?.meta?.dataset_size ?? "?"} registros · Split {data?.meta?.split_type ?? "?"} · Balanceo SMOTE
       </p>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 20 }}>
         {data?.models && Object.entries(data.models).map(([name, m]) => (
           <MetricCard key={name} name={name} data={m} />
         ))}
       </div>
+
+      {data?.meta && (
+        <div style={{ marginTop: 16, background: "#1e293b", border: "1px solid #334155", borderRadius: 12, padding: 20 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: "#38bdf8", marginBottom: 12 }}>Distribución por clase</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 16, fontSize: 12, color: "#94a3b8" }}>
+            <div>
+              <div style={{ color: "#64748b", marginBottom: 6 }}>Train</div>
+              {Object.entries(data.meta.class_dist_train || {}).map(([k, v]) => (
+                <div key={`train-${k}`}>{k}: {v}</div>
+              ))}
+            </div>
+            <div>
+              <div style={{ color: "#64748b", marginBottom: 6 }}>Test</div>
+              {Object.entries(data.meta.class_dist_test || {}).map(([k, v]) => (
+                <div key={`test-${k}`}>{k}: {v}</div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {data?.features && (
         <div style={{ marginTop: 24, background: "#1e293b", border: "1px solid #334155", borderRadius: 12, padding: 20 }}>

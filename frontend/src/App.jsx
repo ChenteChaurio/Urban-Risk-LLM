@@ -13,6 +13,7 @@ export default function App() {
   const [explanation, setExpl] = useState(null);
   const [loading, setLoading] = useState(false);
   const [tenant, setTenant] = useState("bogota");
+  const [selectedLocation, setSelectedLocation] = useState(null);
 
   const API = import.meta.env.VITE_API_URL || "http://localhost:8080/api";
 
@@ -36,9 +37,7 @@ export default function App() {
         body: JSON.stringify({
           intersection_name:  data.intersection_name,
           risk_label:         data.risk_label,
-          congestion_index:   formData.congestion_index,
-          accidents_last_12m: formData.accidents_last_12m,
-          climate_condition:  formData.climate_condition,
+            accidents_last_12m: formData.accidents_last_12m,
           top_k: 3,
         }),
       });
@@ -90,10 +89,10 @@ export default function App() {
         {activeTab === "Predicción" && (
           <div style={{ display: "grid", gridTemplateColumns: "380px 1fr", gap: 24 }}>
             <div>
-              <PredictForm onSubmit={handlePredict} loading={loading} />
+              <PredictForm onSubmit={handlePredict} loading={loading} selectedLocation={selectedLocation} />
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-              <MapaPicker />
+              <MapaPicker onPick={setSelectedLocation} />
               <ResultPanel result={result} explanation={explanation} loading={loading} />
             </div>
           </div>

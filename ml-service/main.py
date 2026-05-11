@@ -5,6 +5,7 @@ Soporta multitenencia mediante tenant_id en cada petición.
 """
 
 import os, json, time, logging
+import requests
 from typing import Optional
 from contextlib import asynccontextmanager
 
@@ -35,13 +36,15 @@ logger = logging.getLogger(__name__)
 MODELS = {}          # {"rf": model, "xgb": model, "dnn": model}
 SCALER = None
 METRICS = {}         # métricas de entrenamiento por modelo
+METRICS_META = {}    # info de dataset y distribuciones
 FAISS_INDEX = None
 CORPUS_DOCS = []
 EMBED_MODEL = None
+PROCESSED_LOCATIONS = None
 FEATURES = [
+    "latitude", "longitude",
     "hour", "day_of_week", "is_peak_hour", "is_weekend",
-    "vehicle_flow", "congestion_index", "accidents_last_12m",
-    "climate_condition", "intersection_type"
+    "severity_local_mean", "accident_rate", "locality_acc_count",
 ]
 RISK_LABELS = {0: "bajo", 1: "medio", 2: "alto"}
 TENANT_MODELS = {
@@ -51,20 +54,76 @@ TENANT_MODELS = {
 
 # ─── Startup ─────────────────────────────────────────────────────────────────
 def train_models():
-    global MODELS, SCALER, METRICS
+    global MODELS, SCALER, METRICS, METRICS_META
+    # Usar exclusivamente el dataset histórico de siniestros
+    hist_path = "/app/data/historico_siniestros_bogota_d.c_-.csv"
+    if not os.path.exists(hist_path):
+        raise RuntimeError("Dataset histórico no encontrado en /app/data. Coloca 'historico_siniestros_bogota_d.c_-.csv' en /data.")
 
-    data_path = "/app/data/bogota_intersections.csv"
-    if not os.path.exists(data_path):
-        logger.warning("Dataset no encontrado, generando datos sintéticos...")
-        os.system("python /app/data/generate_data.py")
+    logger.info(f"Cargando histórico de siniestros: {hist_path}")
+    df = load_and_preprocess_historico(hist_path)
 
-    df = pd.read_csv(data_path)
-    X = df[FEATURES].values
-    y = df["risk_label"].values
+    # Agregar por ubicación aproximada para facilitar consultas por coordenadas
+    global PROCESSED_LOCATIONS
+    try:
+        grp = df.groupby(["latitude", "longitude"])
+        locs = []
+        for (lat, lon), g in grp:
+            def safe_mean(col):
+                return float(g[col].mean()) if col in g.columns else 0.0
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, stratify=y, random_state=42
-    )
+            locs.append({
+                "latitude": float(lat),
+                "longitude": float(lon),
+                "accidents_last_12m": int(g["accidents_last_12m"].max()),
+                "severity_local_mean": safe_mean("severity_local_mean"),
+                "accident_rate": safe_mean("accident_rate"),
+                "locality_acc_count": safe_mean("locality_acc_count"),
+                "intersection_name": g.get("intersection_name", pd.Series([f"{lat},{lon}"])).mode().iloc[0] if not g.get("intersection_name", pd.Series()).mode().empty else f"{lat},{lon}",
+            })
+        PROCESSED_LOCATIONS = pd.DataFrame(locs)
+        logger.info(f"Ubicaciones procesadas: {len(PROCESSED_LOCATIONS)}")
+    except Exception:
+        PROCESSED_LOCATIONS = None
+
+    # Mantener solo las FEATURES auténticas
+    X_all = df[[c for c in FEATURES if c in df.columns]]
+    y_all = df["risk_label"]
+
+    # Split temporal para evitar fuga: entrenar con el pasado, probar con el futuro
+    if "dt" not in df.columns:
+        raise RuntimeError("Columna 'dt' no disponible para split temporal")
+
+    cutoff = df["dt"].quantile(0.8)
+    train_df = df[df["dt"] <= cutoff]
+    test_df = df[df["dt"] > cutoff]
+
+    # Fallback si el split temporal deja un set vacío
+    if train_df.empty or test_df.empty:
+        X = X_all.values
+        y = y_all.values
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, stratify=y, random_state=42
+        )
+    else:
+        X_train = train_df[[c for c in FEATURES if c in train_df.columns]].values
+        y_train = train_df["risk_label"].values
+        X_test = test_df[[c for c in FEATURES if c in test_df.columns]].values
+        y_test = test_df["risk_label"].values
+
+    # Guardar info de dataset y distribuciones de clases
+    def class_counts(arr):
+        vals, counts = np.unique(arr, return_counts=True)
+        return {RISK_LABELS[int(v)]: int(c) for v, c in zip(vals, counts)}
+
+    METRICS_META = {
+        "dataset_size": int(len(df)),
+        "split_type": "temporal_80_20",
+        "train_size": int(len(y_train)),
+        "test_size": int(len(y_test)),
+        "class_dist_train": class_counts(y_train),
+        "class_dist_test": class_counts(y_test),
+    }
 
     # Balanceo SMOTE
     sm = SMOTE(random_state=42)
@@ -105,8 +164,9 @@ def train_models():
 
     logger.info("Entrenando Red Neuronal...")
     dnn = MLPClassifier(
-        hidden_layer_sizes=(128, 64), activation="relu",
-        max_iter=200, random_state=42
+        hidden_layer_sizes=(96, 48), activation="relu",
+        max_iter=100, early_stopping=True, n_iter_no_change=10,
+        random_state=42
     )
     MODELS["dnn"], METRICS["dnn"] = eval_model(dnn, X_train_sc, X_test_sc)
 
@@ -138,6 +198,41 @@ def build_rag_index():
     FAISS_INDEX = faiss.IndexFlatIP(dim)
     FAISS_INDEX.add(embeddings.astype(np.float32))
     logger.info(f"✅ Índice FAISS construido: {FAISS_INDEX.ntotal} vectores (dim={dim})")
+
+
+def compute_features_for_coords(lat: float, lon: float, radius_m: int = 200) -> dict:
+    """Devuelve features históricas agregadas cerca de lat/lon. Retorna campos reales del histórico."""
+    global PROCESSED_LOCATIONS
+    if PROCESSED_LOCATIONS is None or PROCESSED_LOCATIONS.empty:
+        raise HTTPException(status_code=500, detail="Datos históricos no disponibles para consultas por coordenadas")
+
+    df = PROCESSED_LOCATIONS.copy()
+    # distancia aproximada en grados
+    df["dist_deg"] = ((df["latitude"] - lat) ** 2 + (df["longitude"] - lon) ** 2) ** 0.5
+    radius_deg = radius_m / 111000.0
+    nearby = df[df["dist_deg"] <= radius_deg]
+    if nearby.empty:
+        nearest = df.loc[df["dist_deg"].idxmin()]
+        return {
+            "intersection_name": nearest.get("intersection_name"),
+            "latitude": float(nearest.get("latitude")),
+            "longitude": float(nearest.get("longitude")),
+            "accidents_last_12m": int(nearest.get("accidents_last_12m")),
+            "severity_local_mean": float(nearest.get("severity_local_mean", 0.0)),
+            "accident_rate": float(nearest.get("accident_rate", 0.0)),
+            "locality_acc_count": float(nearest.get("locality_acc_count", 0.0)),
+        }
+
+    agg = {
+        "intersection_name": nearby["intersection_name"].mode().iloc[0],
+        "latitude": float(nearby["latitude"].mean()),
+        "longitude": float(nearby["longitude"].mean()),
+        "accidents_last_12m": int(nearby["accidents_last_12m"].max()),
+        "severity_local_mean": float(nearby["severity_local_mean"].mean()) if "severity_local_mean" in nearby.columns else 0.0,
+        "accident_rate": float(nearby["accident_rate"].mean()) if "accident_rate" in nearby.columns else 0.0,
+        "locality_acc_count": float(nearby["locality_acc_count"].mean()) if "locality_acc_count" in nearby.columns else 0.0,
+    }
+    return agg
 
 
 @asynccontextmanager
@@ -172,20 +267,18 @@ class PredictRequest(BaseModel):
     longitude: float
     hour: int
     day_of_week: int
-    vehicle_flow: float
-    congestion_index: float
     accidents_last_12m: int
-    climate_condition: int        # 0=seco 1=lluvia 2=tormenta
-    intersection_type: int        # 0=semáforo 1=rotonda 2=sin control
+    severity_local_mean: Optional[float] = 0.0
+    accident_rate: Optional[float] = 0.0
+    locality_acc_count: Optional[float] = 0.0
+    # Solo se aceptan campos derivados del histórico; otros datos no están disponibles
     model_override: Optional[str] = None  # rf | xgb | dnn
 
 
 class ExplainRequest(BaseModel):
     intersection_name: str
     risk_label: str               # "bajo" | "medio" | "alto"
-    congestion_index: float
     accidents_last_12m: int
-    climate_condition: int
     top_k: int = 3
 
 
@@ -193,10 +286,13 @@ class ExplainRequest(BaseModel):
 def build_features(req: PredictRequest) -> np.ndarray:
     is_peak = 1 if req.hour in [7, 8, 9, 17, 18, 19] else 0
     is_weekend = 1 if req.day_of_week >= 5 else 0
+    # Solo features derivadas directamente del histórico
     return np.array([[
+        req.latitude, req.longitude,
         req.hour, req.day_of_week, is_peak, is_weekend,
-        req.vehicle_flow, req.congestion_index, req.accidents_last_12m,
-        req.climate_condition, req.intersection_type
+        float(req.severity_local_mean or 0.0),
+        float(req.accident_rate or 0.0),
+        float(req.locality_acc_count or 0.0),
     ]])
 
 
@@ -253,13 +349,10 @@ def predict(req: PredictRequest, x_tenant_id: str = Header(default="bogota")):
 def explain(req: ExplainRequest, x_tenant_id: str = Header(default="bogota")):
     t0 = time.time()
 
-    # Construir query semántica
-    climate_map = {0: "clima seco", 1: "condiciones de lluvia", 2: "tormenta"}
+    # Construir query semántica basada solo en información histórica disponible
     query = (
         f"Intersección de {req.risk_label} riesgo vial con {req.accidents_last_12m} "
-        f"accidentes en 12 meses, índice de congestión {req.congestion_index:.2f}, "
-        f"{climate_map.get(req.climate_condition, 'condiciones normales')}. "
-        f"Normativa aplicable y medidas de intervención."
+        f"accidentes en 12 meses. Normativa aplicable y medidas de intervención."
     )
 
     # Recuperación semántica FAISS
@@ -279,7 +372,29 @@ def explain(req: ExplainRequest, x_tenant_id: str = Header(default="bogota")):
             })
 
     # Generación de explicación basada en documentos recuperados
-    explanation = _generate_explanation(req, retrieved)
+    # Si hay una key de Groq configurada, generar con LLM; si no, usar explicación local
+    llm_resp = None
+    try:
+        prompt_parts = [
+            f"Context: Se tiene la predicción de riesgo '{req.risk_label}' para la intersección {req.intersection_name}.\n",
+            "Documentos recuperados:\n",
+        ]
+        # añadir excerpts acotados
+        for d in retrieved:
+            excerpt = d.get("excerpt", "")
+            # limitar excerpt
+            if len(excerpt) > 1500:
+                excerpt = excerpt[:1500] + "..."
+            prompt_parts.append(f"- {d.get('title')}:\n{excerpt}\n")
+
+        prompt_parts.append("\nInstrucciones: Explica brevemente por qué la intersección podría ser de ese nivel de riesgo, cita los fragmentos relevantes y sugiere medidas prácticas de intervención concordes con la normativa citada. Sé conciso (máx. 300 tokens).")
+        prompt = "\n".join(prompt_parts)
+
+        llm_resp = call_groq_llm(prompt)
+    except Exception:
+        llm_resp = None
+
+    explanation = llm_resp if llm_resp else _generate_explanation(req, retrieved)
 
     latency_ms = round((time.time() - t0) * 1000, 2)
     return {
@@ -293,67 +408,191 @@ def explain(req: ExplainRequest, x_tenant_id: str = Header(default="bogota")):
 
 
 def _generate_explanation(req: ExplainRequest, docs: list) -> str:
-    """Genera explicación en lenguaje natural basada en los documentos recuperados."""
-    climate_map = {0: "condiciones secas", 1: "lluvia moderada", 2: "tormenta"}
-    inter_map   = {0: "intersección semaforizada", 1: "rotonda", 2: "intersección sin control semafórico"}
-    climate_str = climate_map.get(req.climate_condition, "condiciones normales")
-    inter_str   = inter_map.get(0, "intersección")
+    """Genera explicación usando los fragmentos recuperados (excerpts) y los cita.
+    Evita textos completamente hardcodeados y muestra los fragmentos relevantes."""
+    header = (
+        f"Intersección: {req.intersection_name}. Clasificación: {req.risk_label.upper()}. "
+        f"Accidentes últimos 12 meses: {req.accidents_last_12m}.\n\n"
+    )
 
-    primary_doc = docs[0] if docs else None
-    secondary_doc = docs[1] if len(docs) > 1 else None
+    if not docs:
+        return header + "No se encontraron documentos normativos relevantes para esta consulta."
 
-    if req.risk_label == "alto":
-        base = (
-            f"La intersección '{req.intersection_name}' ha sido clasificada como de RIESGO ALTO "
-            f"debido a que registra {req.accidents_last_12m} incidentes en los últimos 12 meses "
-            f"y presenta un índice de congestión de {req.congestion_index:.2f} bajo {climate_str}. "
-        )
-        if primary_doc:
-            base += (
-                f"Conforme a lo establecido en '{primary_doc['title']}', esta situación activa "
-                f"los protocolos de intervención prioritaria. "
-            )
-        if secondary_doc:
-            base += (
-                f"Adicionalmente, '{secondary_doc['title']}' establece que las autoridades "
-                f"competentes deben revisar la señalización y evaluar la implementación de "
-                f"sistemas semafóricos adaptativos en esta ubicación. "
-            )
-        base += (
-            "Se recomienda incluir esta intersección en el Plan de Intervención Prioritaria "
-            "con horizonte de ejecución no mayor a 18 meses."
-        )
+    parts = [header, "Fragmentos normativos relevantes:"]
+    for i, d in enumerate(docs, start=1):
+        parts.append(f"{i}) {d['title']} (similitud: {d['similarity']}):\n{d['excerpt']}\n")
 
-    elif req.risk_label == "medio":
-        base = (
-            f"La intersección '{req.intersection_name}' presenta un nivel de RIESGO MEDIO, "
-            f"con {req.accidents_last_12m} incidentes registrados en 12 meses e índice de "
-            f"congestión de {req.congestion_index:.2f}. "
-        )
-        if primary_doc:
-            base += (
-                f"Según '{primary_doc['title']}', esta categoría requiere seguimiento semestral "
-                f"y puede requerir medidas de señalización preventiva. "
-            )
-        base += (
-            "Se recomienda monitoreo continuo de los indicadores y revisión de la señalización "
-            "existente para prevenir el escalamiento a riesgo alto."
-        )
+    parts.append("Sugerencia: revisar los fragmentos anteriores para identificar obligaciones y medidas aplicables a la intersección. Las medidas sugeridas deben contrastarse con los protocolos institucionales.")
+    return "\n".join(parts)
 
-    else:  # bajo
-        base = (
-            f"La intersección '{req.intersection_name}' se clasifica en RIESGO BAJO, "
-            f"con {req.accidents_last_12m} incidentes en 12 meses e índice de congestión "
-            f"de {req.congestion_index:.2f} bajo {climate_str}. "
-        )
-        if primary_doc:
-            base += (
-                f"De acuerdo con '{primary_doc['title']}', los indicadores se encuentran "
-                f"dentro de los rangos operativos normales. "
-            )
-        base += "No se requiere intervención prioritaria en el período evaluado."
 
-    return base
+def call_groq_llm(prompt: str, max_tokens: int = 400, timeout: int = 15) -> str:
+    """Llama a Groq API (https://api.groq.com/openai/v1/chat/completions).
+    Si no hay `GROQ_API_KEY` en el entorno, lanza RuntimeError.
+    Usa formato compatible con OpenAI (messages).
+    """
+    api_key = os.environ.get("GROQ_API_KEY")
+    api_url = os.environ.get("GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions")
+    model_name = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY no configurada")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": "Eres un experto en movilidad urbana y normativa de tránsito. Proporciona explicaciones claras, concisas y basadas en documentos de referencia."},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.7,
+    }
+
+    try:
+        resp = requests.post(api_url, headers=headers, json=payload, timeout=timeout)
+        if resp.status_code >= 400:
+            logger.error(f"Error llamando a Groq: {resp.status_code} {resp.text}")
+            resp.raise_for_status()
+        data = resp.json()
+
+        # Extraer texto del formato OpenAI-compatible de xAI
+        if isinstance(data, dict) and "choices" in data and len(data["choices"]) > 0:
+            choice = data["choices"][0]
+            msg = choice.get("message", {})
+            content = msg.get("content", "")
+            logger.info("✅ Explicacion generada por Groq")
+            return content.strip()
+
+        logger.warning(f"Respuesta inesperada de Groq: {data}")
+        return str(data)
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error llamando a Groq: {e}")
+        raise
+
+
+def load_and_preprocess_historico(path: str) -> pd.DataFrame:
+    """Carga el histórico de siniestros y mapea a las columnas esperadas por el pipeline.
+    Produce columnas: hour, day_of_week, is_peak_hour, is_weekend,
+    accidents_last_12m, latitude, longitude, intersection_name, risk_label, tenant_id, dt
+    """
+    logger.info(f"Preprocesando histórico desde {path}")
+    df = pd.read_csv(path, parse_dates=["FECHA_HORA_ACC"], dayfirst=False, encoding="utf-8", low_memory=False)
+
+    # Normalizar nombres de columnas con lat/lon y fecha
+    if "FECHA_HORA_ACC" in df.columns:
+        df["dt"] = pd.to_datetime(df["FECHA_HORA_ACC"], errors="coerce")
+    elif "FECHA_OCURRENCIA_ACC" in df.columns:
+        df["dt"] = pd.to_datetime(df["FECHA_OCURRENCIA_ACC"], errors="coerce")
+    else:
+        df["dt"] = pd.to_datetime(df.iloc[:,0], errors="coerce")
+
+    df = df.dropna(subset=["dt"]) 
+    # lat/lon columns may be named LATITUD/LONGITUD or Y/X
+    lat_col = "LATITUD" if "LATITUD" in df.columns else ("Y" if "Y" in df.columns else None)
+    lon_col = "LONGITUD" if "LONGITUD" in df.columns else ("X" if "X" in df.columns else None)
+
+    if not lat_col or not lon_col:
+        raise RuntimeError("No se encontraron columnas de latitud/longitud en el histórico")
+
+    df["latitude"] = pd.to_numeric(df[lat_col], errors="coerce")
+    df["longitude"] = pd.to_numeric(df[lon_col], errors="coerce")
+    df = df.dropna(subset=["latitude", "longitude"])
+
+    # Agrupar por ubicación aproximada (3 decimales) para contar accidentes por punto
+    df["lat_r"] = df["latitude"].round(3)
+    df["lon_r"] = df["longitude"].round(3)
+
+    # Ordenar por fecha para conteos temporales
+    df = df.sort_values("dt")
+
+    # Para cada fila, contar accidentes en los 365 días anteriores y posteriores en la misma ubicación
+    df["accidents_last_12m"] = 0
+    df["accidents_next_12m"] = 0
+    groups = df.groupby(["lat_r", "lon_r"])
+    out_rows = []
+    for (lat_r, lon_r), grp in groups:
+        grp = grp.copy()
+        grp = grp.sort_values("dt")
+        past_counts = []
+        future_counts = []
+        for idx, cur in grp.iterrows():
+            window_start = cur["dt"] - pd.Timedelta(days=365)
+            window_end = cur["dt"] + pd.Timedelta(days=365)
+            cnt_past = grp[(grp["dt"] >= window_start) & (grp["dt"] < cur["dt"])].shape[0]
+            cnt_future = grp[(grp["dt"] > cur["dt"]) & (grp["dt"] <= window_end)].shape[0]
+            past_counts.append(cnt_past)
+            future_counts.append(cnt_future)
+        grp["accidents_last_12m"] = past_counts
+        grp["accidents_next_12m"] = future_counts
+        out_rows.append(grp)
+
+    df_proc = pd.concat(out_rows, ignore_index=True)
+
+    # Features time-based
+    df_proc["hour"] = df_proc["dt"].dt.hour
+    df_proc["day_of_week"] = df_proc["dt"].dt.weekday
+    df_proc["is_peak_hour"] = df_proc["hour"].isin([7,8,9,17,18,19]).astype(int)
+    df_proc["is_weekend"] = df_proc["day_of_week"].isin([5,6]).astype(int)
+
+    # No inventamos features que no estén en el histórico.
+    max_cnt_future = max(1, df_proc["accidents_next_12m"].max())
+
+    # Severidad (GRAVEDAD) a score numerico
+    if "GRAVEDAD" in df_proc.columns:
+        def severity_score(val: str) -> float:
+            s = str(val).upper()
+            if "MUER" in s:
+                return 2.0
+            if "HER" in s:
+                return 1.0
+            return 0.0
+        df_proc["severity_score_raw"] = df_proc["GRAVEDAD"].apply(severity_score)
+    else:
+        df_proc["severity_score_raw"] = 0.0
+
+    # Estadisticas locales por ubicacion aproximada
+    loc_grp = df_proc.groupby(["lat_r", "lon_r"], as_index=False)
+    df_proc["severity_local_mean"] = loc_grp["severity_score_raw"].transform("mean")
+    df_proc["loc_total_acc"] = loc_grp["accidents_last_12m"].transform("count")
+    df_proc["accident_rate"] = (df_proc["accidents_last_12m"] + 1) / (df_proc["loc_total_acc"] + 1)
+
+    # Conteo por localidad (frecuencia total por localidad)
+    if "LOCALIDAD" in df_proc.columns:
+        loc_counts = df_proc["LOCALIDAD"].value_counts()
+        df_proc["locality_acc_count"] = df_proc["LOCALIDAD"].map(loc_counts).fillna(0.0)
+    else:
+        df_proc["locality_acc_count"] = 0.0
+
+    # intersection name from DIRECCION or FORMULARIO
+    if "DIRECCION" in df_proc.columns:
+        df_proc["intersection_name"] = df_proc["DIRECCION"].astype(str)
+    elif "FORMULARIO" in df_proc.columns:
+        df_proc["intersection_name"] = df_proc["FORMULARIO"].astype(str)
+    else:
+        df_proc["intersection_name"] = (df_proc["lat_r"].astype(str) + "," + df_proc["lon_r"].astype(str))
+    # risk_label: discretizar en base a accidentes en los 12 meses futuros (balanceado)
+    target = df_proc["accidents_next_12m"]
+    if target.nunique() >= 3:
+        try:
+            df_proc["risk_label"] = pd.qcut(target, q=3, labels=[0, 1, 2]).astype(int)
+        except ValueError:
+            df_proc["risk_label"] = pd.cut(target, bins=[-1, 0, 2, target.max()], labels=[0, 1, 2]).astype(int)
+    else:
+        df_proc["risk_label"] = pd.cut(target, bins=[-1, 0, 2, target.max()], labels=[0, 1, 2]).astype(int)
+    df_proc["tenant_id"] = "bogota"
+
+    # Seleccionar columnas necesarias (solo las que existen y son auténticas)
+    cols_needed = [
+        "intersection_name", "latitude", "longitude",
+        "hour", "day_of_week", "is_peak_hour", "is_weekend",
+        "accidents_last_12m", "severity_local_mean", "accident_rate", "locality_acc_count",
+        "risk_label", "tenant_id", "dt"
+    ]
+    return df_proc[[c for c in cols_needed if c in df_proc.columns]]
 
 
 @app.get("/metrics")
@@ -362,6 +601,7 @@ def metrics():
         "models": METRICS,
         "features": FEATURES,
         "risk_classes": RISK_LABELS,
+        "meta": METRICS_META,
         "tenant_model_mapping": TENANT_MODELS,
     }
 
@@ -372,3 +612,19 @@ def list_models():
         "available": list(MODELS.keys()),
         "tenant_defaults": TENANT_MODELS,
     }
+
+
+@app.post("/features")
+def features_for_location(payload: dict):
+    """POST /features
+    Body: { "latitude": float, "longitude": float, "radius_m": int (optional) }
+    Returns computed features from historical dataset for that location.
+    """
+    lat = payload.get("latitude")
+    lon = payload.get("longitude")
+    radius = int(payload.get("radius_m", 200))
+    if lat is None or lon is None:
+        raise HTTPException(status_code=400, detail="'latitude' and 'longitude' required")
+
+    features = compute_features_for_coords(float(lat), float(lon), radius)
+    return features
